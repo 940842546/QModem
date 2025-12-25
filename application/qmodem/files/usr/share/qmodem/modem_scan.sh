@@ -4,7 +4,6 @@ action=$1
 config=$2
 slot_type=$3
 modem_support=$(cat /usr/share/qmodem/modem_support.json)
-modem_port_rule=$(cat /usr/share/qmodem/modem_port_rule.json)
 debug_subject="modem_scan"
 source /lib/functions.sh
 source /usr/share/qmodem/modem_util.sh
@@ -110,6 +109,8 @@ scan_pcie()
 {
     #beta
     m_debug "scan_pcie"
+    echo 1 > /sys/bus/pci/rescan
+    sleep 1
     pcie_net_device_prefixs="rmnet wwan"
     pcie_slots=""
     for pcie_net_device_prefix in $pcie_net_device_prefixs; do
@@ -190,11 +191,18 @@ scan_pcie_slot_interfaces()
         local assoc_usb_path="/sys/bus/usb/devices/$associated_usb"
         local slot_interfaces=$(ls $assoc_usb_path | grep -E "$associated_usb:[0-9]\.[0-9]+")
         echo checking slot_interfaces: $slot_interfaces
+        slot_vid=$(cat "$assoc_usb_path/$interface/idVendor")
+        slot_pid=$(cat "$assoc_usb_path/$interface/idProduct")
+        modem_port_rule=$(cat /usr/share/qmodem/modem_port_rule.json)
+        modem_port_config=$(echo $modem_port_rule | jq --arg id "$slot_vid:$slot_pid" '.modem_port_rule.usb[$id]')
+        included_ports=$(echo $modem_port_config | jq -r '.include // empty')
         for interface in $slot_interfaces; do
             unset device
             unset ttyUSB_device
             unset ttyACM_device
             interface_driver_path="$assoc_usb_path/$interface/driver"
+            if_port=$(echo "$interface" | grep -oE "[0-9]+\.[0-9]+$" || echo "")
+            include_ports=$(echo $included_ports | jq --arg port "$if_port" 'index($port)')
             [ ! -d "$interface_driver_path" ] && continue
             interface_driver=$(basename $(readlink $interface_driver_path))
             [ -z "$interface_driver" ] && continue
@@ -206,6 +214,13 @@ scan_pcie_slot_interfaces()
                     ttyUSB_device=$(ls "$assoc_usb_path/$interface/" | grep ttyUSB)
                     ttyACM_device=$(ls "$assoc_usb_path/$interface/" | grep ttyACM)
                     [ -z "$ttyUSB_device" ] && [ -z "$ttyACM_device" ] && continue
+                    if [ -n "$included_ports" ]; then
+                        if [ -n "$if_port" ]; then
+                            index=$(echo $included_ports | jq --arg port "$if_port" 'index($port)')
+                            m_debug "included_ports: $included_ports if_port: $if_port index: $index"
+                            [ "$index" != "null" ] || continue
+                        fi
+                    fi
                     [ -n "$ttyUSB_device" ] && device="$ttyUSB_device"
                     [ -n "$ttyACM_device" ] && device="$ttyACM_device"
                     [ -z "$tty_devices" ] && tty_devices="$device" || tty_devices="$tty_devices $device"
@@ -224,34 +239,8 @@ scan_usb_slot_interfaces()
     net_devices=""
     tty_devices=""
     [ ! -d "$slot_path" ] && return
-
-    slot_vid=$(cat "$slot_path/idVendor" 2>/dev/null || echo "")
-    slot_pid=$(cat "$slot_path/idProduct" 2>/dev/null || echo "")
-
-    # m_debug "($slot_vid:$slot_pid) $slot_path"
-
-    if [ -n "$slot_vid" ] && [ -n "$slot_pid" ]; then
-        modem_port_config=$(echo $modem_port_rule | jq '.modem_port_rule."'$slot_type'"."'$slot_vid:$slot_pid'"')
-        if [ "$modem_port_config" != "null" ] && [ -n "$modem_port_config" ]; then
-            config_modem_name=$(echo $modem_port_config | jq -r '.name' 2>/dev/null || echo "")
-            include_ports=$(echo $modem_port_config | jq -r '.include[]' 2>/dev/null || echo "")
-            option_driver=$(echo $modem_port_config | jq -r '.option_driver' 2>/dev/null || echo "0")
-
-            if [ -n "$include_ports" ]; then
-                include_mode=1
-                m_debug "using special config for $config_modem_name($slot_vid:$slot_pid) with ports: $include_ports"
-            fi
-        fi
-    else
-        m_debug "Unable to read VID/PID from device path: $slot_path"
-    fi
-
-    if [ "$option_driver" = "1" ] && [ -n "$slot_vid" ] && [ -n "$slot_pid" ]; then
-        if ! echo "$slot_vid $slot_pid" > /sys/bus/usb-serial/drivers/option1/new_id 2>/dev/null; then
-            m_debug "failed to set option driver"
-        fi
-    fi
-
+    slot_vid=$(cat "$slot_path/$interface/idVendor")
+    slot_pid=$(cat "$slot_path/$interface/idProduct")
     local slot_interfaces=$(ls $slot_path | grep -E "$slot:[0-9]\.[0-9]+")
     for interface in $slot_interfaces; do
         unset device
@@ -259,7 +248,10 @@ scan_usb_slot_interfaces()
         unset ttyACM_device
         interface_driver_path="$slot_path/$interface/driver"
         [ ! -d "$interface_driver_path" ] && continue
-        interface_driver=$(basename $(readlink $interface_driver_path))
+        interface_driver=$(basename $(readlink "$interface_driver_path"))
+        modem_port_rule=$(cat /usr/share/qmodem/modem_port_rule.json)
+        modem_port_config=$(echo $modem_port_rule | jq --arg id "$slot_vid:$slot_pid" '.modem_port_rule.usb[$id]')
+        included_ports=$(echo $modem_port_config | jq -r '.include // empty')
         [ -z "$interface_driver" ] && continue
 
         local if_port=$(echo "$interface" | grep -oE "[0-9]+\.[0-9]+$" || echo "")
@@ -275,21 +267,16 @@ scan_usb_slot_interfaces()
                 [ -n "$ttyUSB_device" ] && device="$ttyUSB_device"
                 [ -n "$ttyACM_device" ] && device="$ttyACM_device"
 
-                local should_include=1
-
-                if [ $include_mode -eq 1 ]; then
-                    should_include=0
-                    for included_port in $include_ports; do
-                        if [ -n "$if_port" ] && [ "$included_port" = "$if_port" ]; then
-                            should_include=1
-                            break
-                        fi
-                    done
+                local if_port=$(echo "$interface" | grep -oE "[0-9]+\.[0-9]+$" || echo "")
+                if [ -n "$included_ports" ]; then
+                    if [ -n "$if_port" ]; then
+                        index=$(echo $included_ports | jq --arg port "$if_port" 'index($port)')
+                        m_debug "included_ports: $included_ports if_port: $if_port index: $index"
+                        [ "$index" != "null" ] || continue
+                    fi
                 fi
-
-                if [ $should_include -eq 1 ]; then
-                    [ -z "$tty_devices" ] && tty_devices="$device" || tty_devices="$tty_devices $device"
-                fi
+                [ -z "$tty_devices" ] && tty_devices="$device" || tty_devices="$tty_devices $device"
+                
             ;;
             qmi_wwan*|\
             cdc_mbim|\
@@ -314,6 +301,8 @@ validate_at_port()
     for at_port in $at_ports; do
         dev_path="/dev/$at_port"
         [ ! -e "$dev_path" ] && continue
+        #disable at-daemon binding
+        ubus call at-daemon close '{ "at_port": "'$dev_path'" }' 2>/dev/null
         res=$(fastat $dev_path "ATI")
         [ -z "$res" ] && continue
         !(echo "$res" | grep -qE 'OK|ATI') && continue
@@ -335,9 +324,6 @@ match_config()
     
     #FM190W-GL 5G Module
     [[ "$name" = *"fm190w-gl"* ]] && name="fm190w-gl"
-
-    #RM500U-CNV
-    [[ "$name" = *"rm500u-cn"* ]] && name="rm500u-cn"
 
     [[ "$name" = *"rm500u-ea"* ]] && name="rm500u-ea"
     #t99w175
@@ -379,11 +365,15 @@ get_modem_model()
     cgmm=$(at $at_port "AT+CGMM")
     sleep 1
     cgmm_1=$(at $at_port "AT+CGMM?")
+    sleep 1
+    gmm=$(at $at_port "AT+GMM")
     name_1=$(echo -e "$cgmm" |grep "+CGMM: " | awk -F': ' '{print $2}')
     name_2=$(echo -e "$cgmm_1" |grep "+CGMM: " | awk -F'"' '{print $2} '| cut -d ' ' -f 1)
     name_3=$(echo -e "$cgmm" | sed -n '2p')
     name_4=$(echo -e "$cgmm" | sed -n '3p')
     name_5=$(echo -e "$cgmm" |grep "+CGMM: " | awk -F'"' '{print $2} '| cut -d ' ' -f 1)
+    name_6=$(echo -e "$gmm" | sed -n '2p')
+    name_7=$(echo -e "$gmm" | sed -n '3p')
     modem_name=""
 
     [ -n "$name_1" ] && match_config "$name_1"
@@ -391,6 +381,8 @@ get_modem_model()
     [ -n "$name_3" ] && [ -z "$modem_name" ] && match_config "$name_3"
     [ -n "$name_4" ] && [ -z "$modem_name" ] && match_config "$name_4"
     [ -n "$name_5" ] && [ -z "$modem_name" ] && match_config "$name_5"
+    [ -n "$name_6" ] && [ -z "$modem_name" ] && match_config "$name_6"
+    [ -n "$name_7" ] && [ -z "$modem_name" ] && match_config "$name_7"
     [ -z "$modem_name" ] && return 1
     return 0
 }
@@ -458,15 +450,15 @@ add()
         modem_count=$(uci -q get qmodem.main.modem_count)
         [ -z "$modem_count" ] && modem_count=0
         modem_count=$(($modem_count+1))
-        uci set qmodem.main.modem_count=$modem_count
-        uci set qmodem.$section_name=modem-device
-        [ -n "$default_alias" ] && uci set  qmodem.${section_name}.alias="$default_alias"
+        uci -q set qmodem.main.modem_count=$modem_count
+        uci -q set qmodem.$section_name=modem-device
+        [ -n "$default_alias" ] && uci -q set  qmodem.${section_name}.alias="$default_alias"
         uci commit qmodem
         lock -u /tmp/lock/modem_add
     #release lock
         metric=$(($modem_count+10))
         [ -n "$default_metric" ] && metric=$default_metric
-        uci batch << EOF
+        uci -q batch << EOF
 set qmodem.$section_name.path="$modem_path"
 set qmodem.$section_name.data_interface="$slot_type"
 set qmodem.$section_name.enable_dial="1"
@@ -477,7 +469,7 @@ set qmodem.$section_name.state="enabled"
 set qmodem.$section_name.metric=$metric
 EOF
     fi
-    uci batch <<EOF
+    uci -q batch <<EOF
 set qmodem.$section_name.name=$modem_name
 set qmodem.$section_name.network=$net_devices
 set qmodem.$section_name.manufacturer=$manufacturer
@@ -485,22 +477,22 @@ set qmodem.$section_name.platform=$platform
 set qmodem.$section_name.suggest_pdp_index=$pdp_index
 EOF
 
-    [ -n "$wcdma_available_band" ] && uci set qmodem.$section_name.wcdma_band=$wcdma_available_band
-    [ -n "$lte_available_band" ] && uci set qmodem.$section_name.lte_band=$lte_available_band
-    [ -n "$nsa_available_band" ] && uci set qmodem.$section_name.nsa_band=$nsa_available_band
-    [ -n "$sa_available_band" ] && uci set qmodem.$section_name.sa_band=$sa_available_band
+    [ -n "$wcdma_available_band" ] && uci -q set qmodem.$section_name.wcdma_band=$wcdma_available_band
+    [ -n "$lte_available_band" ] && uci -q set qmodem.$section_name.lte_band=$lte_available_band
+    [ -n "$nsa_available_band" ] && uci -q set qmodem.$section_name.nsa_band=$nsa_available_band
+    [ -n "$sa_available_band" ] && uci -q set qmodem.$section_name.sa_band=$sa_available_band
 
     for mode in $modes; do
-        uci add_list qmodem.$section_name.modes=$mode
+        uci -q add_list qmodem.$section_name.modes=$mode
     done
     for at_port in $valid_at_ports; do
-        uci add_list qmodem.$section_name.valid_at_ports="/dev/$at_port"
-        uci set qmodem.$section_name.at_port="/dev/$at_port"
+        uci -q add_list qmodem.$section_name.valid_at_ports="/dev/$at_port"
+        uci -q set qmodem.$section_name.at_port="/dev/$at_port"
     done
     for at_port in $at_ports; do
-        uci add_list qmodem.$section_name.ports="/dev/$at_port"
+        uci -q add_list qmodem.$section_name.ports="/dev/$at_port"
     done
-    [ "$option_driver" == "1" ] && uci set qmodem.$section_name.option_driver="1"
+    [ "$option_driver" == "1" ] && uci -q set qmodem.$section_name.option_driver="1"
     uci commit qmodem
     mkdir -p /var/run/qmodem/${section_name}_dir
     lock -u /tmp/lock/modem_add_$slot
@@ -508,7 +500,7 @@ EOF
     exec_post_init $section_name
 #判断是否重启网络
     [ -n "$is_exist" ] && [ "$orig_network" == "$net_devices" ] && [ "$orig_at_port" == "/dev/$at_port" ] && [ "$orig_state" == "enabled" ] && [ "$orig_name" == "$modem_name" ] && return
-    /etc/init.d/qmodem_network restart
+    /etc/init.d/qmodem_network reload
 }
 
 remove()
@@ -521,9 +513,9 @@ remove()
     modem_count=$(uci -q get qmodem.main.modem_count)
     [ -z "$modem_count" ] && modem_count=0
     modem_count=$(($modem_count-1))
-    uci set qmodem.main.modem_count=$modem_count
+    uci -q set qmodem.main.modem_count=$modem_count
     uci commit qmodem
-    uci batch <<EOF
+    uci -q batch <<EOF
 del qmodem.${section_name}
 del network.${section_name}
 del network.${section_name}v6
@@ -540,8 +532,8 @@ disable()
     local slot=$1
     section_name=$(echo $slot | sed 's/[\.:-]/_/g')
     #reorder to first
-    uci reorder qmodem.$section_name="1"
-    uci set qmodem.$section_name.state="disabled"
+    uci -q reorder qmodem.$section_name="1"
+    uci -q set qmodem.$section_name.state="disabled"
     uci commit qmodem
 }
 
@@ -552,6 +544,7 @@ case $action in
         ;;
     "remove")
         debug_subject="modem_scan_remove"
+        [ -z "$config" ] && exit 1
         remove $config
         ;;
     "disable")

@@ -62,7 +62,7 @@ set system.n${cfg_name}.name=${modem_slot}_net_indicator
 set system.n${cfg_name}.sysfs=${net_led}
 set system.n${cfg_name}.trigger=netdev
 set system.n${cfg_name}.dev=${modem_netcard}
-set system.n${cfg_name}.mode="tx rx"
+set system.n${cfg_name}.mode="link tx rx"
 commit system
 EOF
 
@@ -137,7 +137,9 @@ update_config()
     config_get at_port $modem_config at_port
     config_get manufacturer $modem_config manufacturer
     config_get platform $modem_config platform
+    config_get force_set_apn $modem_config force_set_apn
     config_get pdp_index $modem_config pdp_index
+    [ -n "$pdp_index" ] && userset_pdp_index="1" || userset_pdp_index="0"
     config_get suggest_pdp_index $modem_config suggest_pdp_index
     [ -z "$suggest_pdp_index"] && suggest_pdp_index=$(get_platform_suggest_pdp_index)
     [ -z "$pdp_index" ] && pdp_index=$suggest_pdp_index
@@ -146,7 +148,8 @@ update_config()
     config_get en_bridge $modem_config en_bridge
     config_get do_not_add_dns $modem_config do_not_add_dns
     config_get dns_list $modem_config dns_list
-    config_get connect_check $modem_config connect_check
+    config_get huawei_dial_mode $modem_config huawei_dial_mode
+    config_get donot_nat $modem_config donot_nat 0
     config_get global_dial main enable_dial
     # config_get ethernet_5g u$modem_config ethernet 转往口获取命令更新，待测试
     config_foreach get_associate_ethernet_by_path modem-slot
@@ -156,7 +159,7 @@ update_config()
     update_sim_slot
     case $sim_slot in
         1)
-        config_get apn $modem_config apn "auto"
+        config_get apn $modem_config apn
         config_get username $modem_config username
         config_get password $modem_config password
         config_get auth $modem_config auth
@@ -168,7 +171,7 @@ update_config()
         config_get password $modem_config password2
         config_get auth $modem_config auth2
         config_get pincode $modem_config pincode2
-        [ -z "$apn" ] && config_get apn $modem_config apn "auto"
+        [ -z "$apn" ] && config_get apn $modem_config apn
         [ -z "$username" ] && config_get username $modem_config username
         [ -z "$password" ] && config_get password $modem_config password
         [ -z "$auth" ] && config_get auth $modem_config auth
@@ -279,11 +282,11 @@ check_ip()
                 ipv4=$(echo $ipaddr | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | grep -v "0\.0\.0\.0" | head -n 1)
                 ipv6=$(echo $ipaddr | grep -oE "\b([0-9a-fA-F]{0,4}.){2,7}[0-9a-fA-F]{0,4}\b")
             fi
-            disallow_ipv4="0.0.0.0"
-            #remove the disallow ip
-            if [ "$ipv4" == *"$disallow_ipv4"* ];then
-                ipv4=""
-            fi
+            # disallow_ipv4="0.0.0.0"
+            # #remove the disallow ip
+            # if [[ "$ipv4" == *"$disallow_ipv4"* ]];then
+            #     ipv4=""
+            # fi
             connection_status=0
             if [ -n "$ipv4" ];then
                 connection_status=1
@@ -298,30 +301,6 @@ check_ip()
             connection_status="-1"
             m_debug "at port response unexpected $ipaddr"
         fi
-}
-
-check_connection()
-{
-    [ "$connection_status" = "0" ] || [ "$connection_status" = "-1" ] && return 0
-    if [ -n "$ipv4" ] && [ -n "$modem_netcard" ]; then
-        for i in 1 2; do
-            if ping -I "$modem_netcard" -w 1 1.1.1.1 >/dev/null 2>&1 || 
-               ping -I "$modem_netcard" -w 2 8.8.8.8 >/dev/null 2>&1; then
-                break
-            fi
-            if [ $i -eq 2 ]; then
-                m_debug "IPv4 connection test failed, will redial"
-                return 1
-            fi
-            sleep 1
-        done
-        local ifup_time=$(ubus call network.interface.$interface6_name status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null || echo 0)
-        if [ "$ifup_time" -gt 5 ] && [ "$pdp_type" = "ipv4v6" ]; then
-            rdisc6 $origin_device &
-            ndisc6 fe80::1 $origin_device &
-        fi
-    fi
-    return 0
 }
 
 append_to_fw_zone()
@@ -613,6 +592,13 @@ wwan_hang()
 
 ecm_hang()
 {
+    m_debug "ecm_hang"
+    auto_dial_hang_fail=0
+    auto_dial_hang
+    auto_dial_hang_fail=$?
+    if [ $auto_dial_hang_fail -eq 0 ]; then
+        return
+    fi
     case "$manufacturer" in
         "quectel")
             at_command="AT+QNETDEVCTL=$pdp_index,2,1"
@@ -644,6 +630,19 @@ ecm_hang()
     fastat "${at_port}" "${at_command}"
     [ -n "$delay" ] && sleep "$delay"
 }
+
+auto_dial_stop(){
+    m_debug "stop auto dial"
+    case "$manufacturer" in
+        "huawei")
+        case "$platform" in
+            "unisoc")
+            ;;
+        esac
+        ;;
+    esac
+}
+
 
 hang()
 {
@@ -686,7 +685,7 @@ mhi_dial()
 qmi_dial()
 {
     cmd_line="quectel-CM"
-    [ -e "/usr/bin/quectel-CM-M" ] && cmd_line="quectel-CM-M"
+    [ -e "/usr/bin/quectel-CM-M" ] && cmd_line="quectel-CM-M" && tom_modified=1
     case $pdp_type in
         "ip") cmd_line="$cmd_line -4" ;;
         "ipv6") cmd_line="$cmd_line -6" ;;
@@ -697,17 +696,11 @@ qmi_dial()
     if [ "$network_bridge" = "1" ]; then
         cmd_line="$cmd_line -b"
     fi
-    if [ -n "$pdp_index" ]; then
+    if [ -n "$pdp_index" ] && [ "$userset_pdp_index" = "1" ]; then
         cmd_line="$cmd_line -n $pdp_index"
     fi
-    if [ "$manufacturer" = "telit" ];then
-        test_apn="cbnet"
-        [ "$apn" = "cbnet" ] && test_apn="auto"
-        $cmd_line -s $test_apn &
-        telit_cmd_pid=$!
-        sleep 1
-        kill $telit_cmd_pid 2>/dev/null
-        wait $telit_cmd_pid 2>/dev/null
+    if [ "$manufacturer" = "telit" ] && [ "$force_set_apn" != "1" ];then
+        m_debug 'please use force apn set for telit modem'
     fi
     if [ -n "$apn" ]; then
         cmd_line="$cmd_line -s $apn"
@@ -741,37 +734,43 @@ qmi_dial()
     fi
     if [ -e "/usr/bin/quectel-CM-M" ];then
         [ -n "$metric" ] && cmd_line="$cmd_line -d -M $metric"
+        [ "$force_set_apn" == "1" ] && cmd_line="$cmd_line -F"
     else
         [ -n "$metric" ] && cmd_line="$cmd_line"
     fi
     cmd_line="$cmd_line -f $log_file"
-    m_debug "dialing $cmd_line"
-    exec $cmd_line
-    
-    
+    while true; do
+        m_debug "dialing: $cmd_line"
+        $cmd_line
+        m_debug "quectel-CM exited, retrying dial"
+    done
 }
 
 at_dial()
 {
-    if [ -z "$apn" ];then
-        apn="auto"
-    fi
     if [ -z "$pdp_type" ];then
         pdp_type="IP"
     fi
+    [ -n "$apn" ] && apn_append=",\"$apn\"" || apn_append=""
     local at_command='AT+COPS=0,0'
     tmp=$(at "${at_port}" "${at_command}")
     pdp_type=$(echo $pdp_type | tr 'a-z' 'A-Z')
     case $manufacturer in
         "quectel")
+            [ "$donot_nat" = "1" ] && nat_cfg="AT+QCFG=\"nat\",0" || nat_cfg="AT+QCFG=\"nat\",1"
             case $platform in
                 "hisilicon")
                     at_command="AT+QNETDEVCTL=1,1,1"
                     cgdcont_command=""
                     ;;
+
+                "unisoc")
+                    at_command="AT+QNETDEVCTL=1,$pdp_index,1" # +QNETDEVCTL: <cid>,<op>,<state> 
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
+                    ;;
                 *)
-                    at_command="AT+QNETDEVCTL=$pdp_index,3,1"
-                    cgdcont_command="AT+CGDCONT=$pdp_index1,\"$pdp_type\",\"$apn\""
+                    at_command="AT+QNETDEVCTL=3,$pdp_index,1" #LTE Standard AT+QNETDEVCTL=<connect_type>[,<CID>[,<URC_switch>]] 
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
                     ;;
             esac
             ;;
@@ -779,21 +778,71 @@ at_dial()
             case $platform in
                 "mediatek")
                     delay=3
-                    [ "$apn" = "auto" ] && apn="cbnet"
+                    [ "$apn" = "auto" ] || [ -z "$apn" ] && apn="cbnet"
                     at_command="AT+CGACT=1,$pdp_index"
                     cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
                     ;;
                 "lte")
                     at_command="AT+GTRNDIS=1,$pdp_index"
-                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
+                    if [ -n "$auth" ]; then
+                        case $auth in
+                            "pap") 
+                                auth_num=1 ;;
+                            "chap") 
+                                auth_num=2 ;;
+                            "auto"|"both"|"MsChapV2") 
+                                auth_num=3 ;;
+                            *) 
+                                auth_num=0 ;;
+                        esac
+                        if [ -n "$username" ] || [ -n "$password" ] && [ "$auth_num" != "0" ] ; then
+                            ppp_auth_command="AT+MGAUTH=$pdp_index,$auth_num,\"$username\",\"$password\""
+                        fi
+                    fi
                     ;;
+                "unisoc")
+                    at_command="AT+GTRNDIS=1,$pdp_index"
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
+                    if [ -n "$auth" ]; then
+                        case $auth in
+                            "pap") 
+                                auth_num=1 ;;
+                            "chap") 
+                                auth_num=2 ;;
+                            "auto"|"both"|"MsChapV2") 
+                                auth_num=3 ;;
+                            *) 
+                                auth_num=0 ;;
+                        esac
+                        if [ -n "$username" ] || [ -n "$password" ] && [ "$auth_num" != "0" ] ; then
+                            ppp_auth_command="AT+MGAUTH=$pdp_index,$auth_num,\"$username\",\"$password\""
+                        fi
+                    fi
             esac
             ;;
         "huawei")
             case $platform in
                 "hisilicon")
                     at_command="AT^NDISDUP=1,$pdp_index"
-                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
+                    if [ -n "$auth" ]; then
+                        case $auth in
+                            "pap") 
+                                auth_num=1 ;;
+                            "chap") 
+                                auth_num=2 ;;
+                            "auto"|"both"|"MsChapV2") 
+                                auth_num=3 ;;
+                            *) 
+                                auth_num=0 ;;
+                        esac
+                        if [ -n "$username" ] || [ -n "$password" ] && [ "$auth_num" != "0" ] ; then
+                            plmn=$(at ${at_port} "AT+COPS=3,2;+COPS?" | grep "+COPS:" | sed 's/+COPS: //g' | cut -d',' -f3 | sed 's/\"//g' | cut -c1-5 | grep -o  -o '[0-9]\{5\}')
+                            [ -z "$plmn" ] && plmn="00000"
+                            ppp_auth_command="AT^AUTHDATA=$pdp_index,$auth_num,$plmn,\"$username\",\"$password\""
+                        fi
+                    fi
                     ;;
             esac
             ;;
@@ -802,7 +851,7 @@ at_dial()
                 "qualcomm")
                     local cnmp=$(at ${at_port} "AT+CNMP?" | grep "+CNMP:" | sed 's/+CNMP: //g' | sed 's/\r//g')
                     at_command="AT+CNMP=$cnmp;+CNWINFO=1"
-                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\",\"$apn\""
+                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\""$apn_append
                     ;;
             esac
             ;;
@@ -810,7 +859,7 @@ at_dial()
             case $platform in
                 "qualcomm")
                     at_command='AT$QCRMCALL=1,0,3,2,'$pdp_index
-                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\",\"$apn\""
+                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\""$apn_append
                     ;;
             esac
             ;;
@@ -818,7 +867,7 @@ at_dial()
             case $platform in
                 "unisoc")
                     at_command='AT$MYUSBNETACT=0,1'
-                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\",\"$apn\""
+                    cgdcont_command="AT+CGDCONT=1,\"$pdp_type\""$apn_append
                     ;;
             esac
             ;;
@@ -826,26 +875,106 @@ at_dial()
             case $platform in
                 "qualcomm")
                     at_command="AT#ICMAUTOCONN=1,$pdp_index"
-                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
+                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""$apn_append
                     ;;
             esac
             ;;
     esac
-    at "${at_port}" "${cgdcont_command}"
-    if [ "$driver" = "mtk_pcie" ];then
-	m_debug "dialing vendor:$manufacturer;platform:$platform;$driver;$apn "
-        mbim_port=$(echo "$at_port" | sed 's/at/mbim/g')
-	rf_status=$(umbim -d  $mbim_port radio|sed -n 's/.*swradiostate: *//p')
-	if [ "$rf_status" = "off" ]; then
-    		umbim -d  $mbim_port radio on
-	fi
-	umbim -d $mbim_port disconnect
-        sleep 1
-        umbim -d $mbim_port connect 0 --apn $apn
-    else
-	m_debug "dialing vendor:$manufacturer;platform:$platform; $cgdcont_command ; $at_command"
-	fastat "$at_port" "$at_command"
+	m_debug "dialing: vendor:$manufacturer; platform:$platform; driver:$driver; apn:$apn; command:$at_command"
+    m_debug "dial_cmd: $at_command; cgdcont_cmd: $cgdcont_command; ppp_auth_cmd: $ppp_auth_command"
+	case $driver in
+        "mtk_pcie")
+            mbim_port=$(echo "$at_port" | sed 's/at/mbim/g')
+            [ -n "$apn" ] || apn="auto"
+        	rf_status=$(umbim -d  $mbim_port radio|sed -n 's/.*swradiostate: *//p')
+        	[ "$rf_status" = "off" ] && umbim -d  $mbim_port radio on
+        	umbim -d $mbim_port disconnect
+        	sleep 1
+        	umbim -d $mbim_port connect 0 --apn $apn
+		 	;;
+		*)
+  			at "${at_port}" "${cgdcont_command}"
+            [ -n "$ppp_auth_command" ] && at "${at_port}" "$ppp_auth_command"
+            [ -n "$nat_cfg" ] && at "${at_port}" "$nat_cfg"
+        	at "$at_port" "$at_command"
+		 	;;
+	esac
+}
+
+at_auto_dial()
+{
+    case $manufacturer in
+        "huawei")
+            case $platform in
+                "unisoc")
+                    huawei_auto_dial_unisoc
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+huawei_auto_dial_unisoc()
+{
+    m_debug "huawei_auto_dial: auto dial(no monitor)"
+    m_debug "huawei_auto_dial: vendor:$manufacturer; platform:$platform; driver:$driver; apn:$apn; command:$at_command; pdp_index:$pdp_index; huawei_dial_mode:$huawei_dial_mode; at_port:$at_port"
+    # dial prepare
+    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
+    at "$at_port" "$cgdcont_command"
+    # get current auto dial setting
+    at_command='AT^SETAUTODIAL?'
+    at_res=$(at "$at_port" "$at_command" | grep 'SETAUTO')
+    # return ^SETAUTODAIL:1,x
+    current_setting=${at_res##*:}
+    dial_status=$(echo "$current_setting" | cut -d ',' -f 1)
+    current_dial_mode=$(echo "$current_setting" | cut -d ',' -f 2)
+    m_debug "current dial status: $dial_status, current dial mode: $current_dial_mode"
+    # if dial stat is disabled, or when huawei_dial_mode is not empty and current dial mode is not equal to huawei_dial_mode, enable dial
+    if [ "$dial_status" = "0" ] || [ ! -z "$huawei_dial_mode" ] && [ "$current_dial_mode" != "$huawei_dial_mode" ]; then
+        [ -n "$huawei_dial_mode" ] && dial_mode=",$huawei_dial_mode" || dial_mode=",4"
+        at_command="AT^SETAUTODIAL=1$dial_mode"
+        at "$at_port" "$at_command"
     fi
+}
+
+auto_dial_hang_huawei_unisoc()
+{
+    m_debug "huawei_auto_hang"
+    at_command='AT^SETAUTODIAL?'
+    current_setting=$(at "$at_port" "$at_command" | grep 'SETAUTO')
+    # return ^SETAUTODAIL:1,x
+    current_setting=${current_setting##*:}
+    dial_status=$(echo "$current_setting" | cut -d ',' -f 1)
+    if [ "$dial_status" = "1" ]; then 
+        at_command="AT^SETAUTODIAL=0"
+        at "$at_port" "$at_command"
+        m_debug "huawei_at_hang: auto hang done"
+        m_debug "huawei_at_hang: turning radio off"
+        off_cmd="AT+CFUN=0"
+        on_cmd="AT+CFUN=1"
+        at "$at_port" "$off_cmd"
+        m_debug "huawei_at_hang: turning radio on"
+        at "$at_port" "$on_cmd"
+        return 0
+    fi
+    return 1
+}
+
+auto_dial_hang(){
+    m_debug "auto_dial_hang"
+    case "$manufacturer" in 
+        "huawei")
+            case "$platform" in
+                "unisoc")
+                    auto_dial_hang_huawei_unisoc
+                    return $?
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
 }
 
 ip_change_fm350()
@@ -1002,6 +1131,16 @@ check_logfile_line()
 unexpected_response_count=0
 at_dial_monitor()
 {
+    #check if support auto dial
+    auto_dial_support=0
+    at_auto_dial
+    auto_dial_support=$?
+    if [ $auto_dial_support -eq 0 ]; then
+        m_debug "dialing service is managed by modem(auto dial), do not need monitor"
+        while true; do
+            sleep 30
+        done
+    fi
     at_dial
     ipv4_cache=$ipv4
     ipv6_cache=$ipv6
@@ -1027,7 +1166,16 @@ at_dial_monitor()
                     ipv4_cache=$ipv4
                     ipv6_cache=$ipv6
                 fi
-                [ "$connect_check" -eq 1 ] && { sleep 5; check_connection || { hang && at_dial; }; } || sleep 15
+
+                pdp_type=$(echo $pdp_type | tr 'A-Z' 'a-z')
+                if [ "$pdp_type" = "ipv4v6" ]; then
+                    local ifup_time=$(ubus call network.interface.$interface6_name status 2>/dev/null | jsonfilter -e '@.uptime' 2>/dev/null || echo 0)
+                    local origin_device=$(uci -q get network.$interface_name.device 2>/dev/null || echo "")
+                    [ "$ifup_time" -lt 5 ] && continue
+                    rdisc6 $origin_device &
+                    ndisc6 fe80::1 $origin_device &
+                fi
+                sleep 15
                 ;;
         esac
         check_logfile_line

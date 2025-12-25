@@ -42,6 +42,9 @@ get_mode()
         ;;
         "unisoc")
             case "$mode_num" in
+                "31") mode="ncm" ;;
+                "32") mode="ecm" ;;
+                "33") mode="rndis" ;;
                 "34") mode="ecm" ;;
                 "35") mode="ecm" ;; #-
                 "40") mode="mbim" ;;
@@ -375,7 +378,7 @@ get_temperature()
 {
     #Temperature（温度）
     at_command="AT+MTSM=1,6"
-	response=$(at $at_port $at_command | grep "+MTSM: " | sed 's/+MTSM: //g' | sed 's/\r//g')
+    response=$(at $at_port $at_command | grep "+MTSM: " | sed 's/+MTSM: //g' | sed 's/\r//g')
 
     [ -z "$response" ] && {
         #Fx160及以后型号
@@ -389,6 +392,12 @@ get_temperature()
         at_command="AT+GTSENRDTEMP=1"
         response=$(at $at_port $at_command | grep "+GTSENRDTEMP: " | awk -F',' '{print $2}' | sed 's/\r//g')
         response="${response:0:2}"
+    }
+    
+    [ -z "$response" ] && {
+        #紫光平台
+        at_command="AT+MTSM=1"
+        response=$(at $at_port $at_command | grep "+MTSM: " | sed 's/+MTSM: //g' | sed 's/\r//g')
     }
 
     local temperature
@@ -417,6 +426,7 @@ base_info()
     revision=$(at $at_port $at_command | grep "+CGMR: " | awk -F'"' '{print $2}')
 
     class="Base Information"
+    add_plain_info_entry "name" "$name" "Name"
     add_plain_info_entry "manufacturer" "$manufacturer" "Manufacturer"
     add_plain_info_entry "revision" "$revision" "Revision"
     add_plain_info_entry "at_port" "$at_port" "AT Port"
@@ -467,7 +477,7 @@ sim_info()
 
     #SIM Number（SIM卡号码，手机号）
     at_command="AT+CNUM"
-	sim_number=$(at ${at_port} ${at_command} | grep "+CNUM: " | awk -F'"' '{print $2}')
+    sim_number=$(at ${at_port} ${at_command} | grep "+CNUM: " | awk -F'"' '{print $2}')
     [ -z "$sim_number" ] && {
         sim_number=$(at ${at_port} ${at_command} | grep "+CNUM: " | awk -F'"' '{print $4}')
     }
@@ -475,13 +485,16 @@ sim_info()
     #IMSI（国际移动用户识别码）
     at_command="AT+CIMI?"
     imsi=$(at ${at_port} ${at_command} | grep "+CIMI: " | awk -F' ' '{print $2}' | sed 's/"//g' | sed 's/\r//g')
-	[ -z "$sim_number" ] && {
+    [ -z "$sim_number" ] && {
         imsi=$(at ${at_port} ${at_command} | grep "+CIMI: " | awk -F'"' '{print $2}')
     }
 
     #ICCID（集成电路卡识别码）
     at_command="AT+ICCID"
-	iccid=$(at ${at_port} ${at_command} | grep -o "+ICCID:[ ]*[-0-9]\+" | grep -o "[-0-9]\{1,4\}")
+    iccid=$(at ${at_port} ${at_command} | grep -o "+ICCID:[ ]*[-0-9]\+" | grep -o "[-0-9]\{1,4\}")
+		[ -z "$iccid" ] && {
+        iccid=$(at ${at_port} "AT+CCID" | grep -o "+CCID:[ ]*[-0-9]\+" | awk -F' ' '{print $2}')
+    }
     class="SIM Information"
     case "$sim_status" in
         "ready")
@@ -545,9 +558,6 @@ set_imei()
     get_imei
 
 }
-
-
-
 
 #网络信息
 network_info()
@@ -810,7 +820,7 @@ set_lockband()
             set_lockband_nr
             ;;
         "mediatek")
-            set_lockband_nr
+            set_lockband_nr_mediatek
             ;;
         "lte")
             set_lockband_lte
@@ -828,6 +838,17 @@ set_lockband()
 }
 
 #设置锁频
+set_lockband_nr_mediatek()
+{
+    m_debug "Fibocom set lockband info"
+    get_lockband_config_command="AT+GTACT?"
+    get_lockband_config_res=$(at $at_port $get_lockband_config_command)
+    network_prefer_config=$(echo $get_lockband_config_res |cut -d : -f 2| awk -F"," '{print $1}' |tr -d ' ')
+    local lock_band="$network_prefer_config,6,3,$lock_band"
+    local set_lockband_command="AT+GTACT=$lock_band"
+    res=$(at $at_port $set_lockband_command)
+}
+
 set_lockband_nr()
 {
     m_debug "Fibocom set lockband info nr"
@@ -949,45 +970,29 @@ get_neighborcell()
             continue
         fi
         case $line in
-            *"NR neighbor cell"*)
-                cell_type="NR"
-                continue
-                ;;
-            *"LTE neighbor cell"*)
-                cell_type="LTE"
-                continue
-                ;;
-            *"service cell"*|*"GTCELLINFO"*|*"OK"*)
-                cell_type="undefined"
-                continue
-                ;;
-        esac
-        case $cell_type in
-            "NR")
+            "2,9"*)
+                m_debug "NR line:$line"
                 tac=$(echo "$line" | awk -F',' '{print $5}')
                 cellid=$(echo "$line" | awk -F',' '{print $6}')
                 arfcn=$(echo "$line" | awk -F',' '{print $7}')
                 pci=$(echo "$line" | awk -F',' '{print $8}')
-                ss_sinr=$(echo "$line" | awk -F',' '{print $9}')
-                rxlev=$(echo "$line" | awk -F',' '{print $10}')
-                ss_rsrp=$(echo "$line" | awk -F',' '{print $11}')
-                ss_rsrq=$(echo "$line" | awk -F',' '{print $12}')
-                arfcn=$(echo 'ibase=16;' "$arfcn"  | bc)
-                pci=$(echo 'ibase=16;' "$pci"  | bc)
+                ss_sinr=$(echo "$line" | awk -F',' '{print $10}')
+                rxlev=$(echo "$line" | awk -F',' '{print $11}')
+                ss_rsrp=$(echo "$line" | awk -F',' '{print $12}')
                 json_select "NR"
                 json_add_object ""
                 json_add_string "tac" "$tac"
                 json_add_string "cellid" "$cellid"
                 json_add_string "arfcn" "$arfcn"
                 json_add_string "pci" "$pci"
+                json_add_string "bandwidth" "$bandwidth"
                 json_add_string "ss_sinr" "$ss_sinr"
                 json_add_string "rxlev" "$rxlev"
                 json_add_string "ss_rsrp" "$ss_rsrp"
-                json_add_string "ss_rsrq" "$ss_rsrq"
                 json_close_object
                 json_select ".."
                 ;;
-            "LTE")
+            "2,4"*)
                 tac=$(echo "$line" | awk -F',' '{print $5}')
                 cellid=$(echo "$line" | awk -F',' '{print $6}')
                 arfcn=$(echo "$line" | awk -F',' '{print $7}')
@@ -1051,7 +1056,6 @@ get_neighborcell()
     json_close_object
     json_close_object
 }
-
 
 set_neighborcell(){
     json_param=$1
@@ -1212,7 +1216,10 @@ cell_info()
 
     at_command='AT+GTCCINFO?'
     response=$(at $at_port $at_command)
-    
+
+    at_command='AT+GTCAINFO?'
+    ca_response=$(at $at_port $at_command)
+
     local rat=$(echo "$response" | grep "service" | awk -F' ' '{print $1}')
 
     #适配联发科平台（FM350-GL）
@@ -1221,33 +1228,79 @@ cell_info()
         rat_num=$(at $at_port $at_command | grep "+COPS:" | awk -F',' '{print $4}' | sed 's/\r//g')
         rat=$(get_rat ${rat_num})
     }
-
+    
+    #CSQ（信号强度）
+    at_command="AT+CSQ"
+    csqinfo=$(at ${at_port} ${at_command} | grep "+CSQ:" | sed 's/+CSQ: //g' | sed 's/\r//g')
+    
+    #RSSI（信号强度指示）
+    rssi_num=$(echo $csqinfo | awk -F',' '{print $1}')
+    rssi=$(get_rssi $rssi_num)
+    [ -n "$rssi" ] && rssi_actual=$(printf "%.1f" $(echo "$rssi / 10" | bc -l 2>/dev/null))
+    ca_count=1
+    scc_pci=""
+    scc_arfcn=""
+    scc_band=""
+    scc_dl_bandwidth=""
+    scc_ul_bandwidth=""
     for response in $response; do
         #排除+GTCCINFO:、NR service cell:还有空行
         [ -n "$response" ] && [[ "$response" = *","* ]] && {
 
             case $rat in
                 "NR")
-                    at_command='AT+GTCAINFO?'
-                    ca_response=$(at $at_port $at_command)
-                    if echo "$ca_response" | grep -q "SCC"; then
-                        has_ca=1
-                        scc_info=$(echo "$ca_response" | grep "SCC" | sed 's/\r//g')
-                        scc_band_num=$(echo "$scc_info" | awk -F',' '{print $3}')
-                        scc_arfcn=$(echo "$scc_info" | awk -F',' '{print $5}')
-                        scc_band=$(get_band "NR" ${scc_band_num})
-                        nr_scc_dl_bandwidth_num=$(echo "$scc_info" | awk -F',' '{print $6}')
-                        nr_scc_dl_bandwidth=$(get_bandwidth "NR" ${nr_scc_dl_bandwidth_num})
-                    fi
-                    if [ $has_ca -eq 1 ]; then
-                        network_mode="NR5G-SA CA Mode"
-                    else
-                        network_mode="NR5G-SA Mode"
-                    fi
+                    network_mode="NR5G-SA Mode"
+                    IFS=$'\n'
+                    for ca_res in $ca_response; do
+                        if echo "$ca_res" | grep -q "SCC"; then
+                            ca_count=$((ca_count+1))
+                            scc_ul_ca=$(echo "$ca_res" | awk -F',' '{print $2}')
+                            scc_band_num=$(echo "$ca_res" | awk -F',' '{print $3}')
+                            scc_pci_new=$(echo "$ca_res" | awk -F',' '{print $4}')
+                            if [ -z "$scc_pci" ]; then
+                                scc_pci="$scc_pci_new"
+                            else
+                                scc_pci="$scc_pci / $scc_pci_new"
+                            fi
+                            scc_arfcn_new=$(echo "$ca_res" | awk -F',' '{print $5}')
+                            if [ -z "$scc_arfcn" ]; then
+                                scc_arfcn="$scc_arfcn_new"
+                            else
+                                scc_arfcn="$scc_arfcn / $scc_arfcn_new"
+                            fi
+                            scc_band_new=$(get_band "NR" ${scc_band_num})
+                            if [ -z "$scc_band" ]; then
+                                scc_band="$scc_band_new"
+                            else
+                                scc_band="$scc_band / $scc_band_new"
+                            fi
+                            scc_dl_bandwidth_num=$(echo "$ca_res" | awk -F',' '{print $6}')
+                            scc_dl_bandwidth_new=$(get_bandwidth "NR" ${scc_dl_bandwidth_num})
+                            if [ -z "$scc_dl_bandwidth" ]; then
+                                scc_dl_bandwidth="$scc_dl_bandwidth_new"
+                            else
+                                scc_dl_bandwidth="$scc_dl_bandwidth / $scc_dl_bandwidth_new"
+                            fi
+                            if [ "$scc_ul_ca" = "1" ]; then
+                                scc_ul_bandwidth_new=$scc_dl_bandwidth_new
+                            else
+                                scc_ul_bandwidth_num="-"
+                            fi
+                            if [ -z "$scc_ul_bandwidth" ]; then
+                                scc_ul_bandwidth="$scc_ul_bandwidth_new"
+                            else
+                                scc_ul_bandwidth="$scc_ul_bandwidth / $scc_ul_bandwidth_new"
+                            fi
+                        fi
+                    done
+                    IFS=' '
+                    [ $ca_count -gt 1 ] && network_mode="$network_mode with $ca_count CA"
                     nr_mcc=$(echo "$response" | awk -F',' '{print $3}')
                     nr_mnc=$(echo "$response" | awk -F',' '{print $4}')
                     nr_tac=$(echo "$response" | awk -F',' '{print $5}')
+                    nr_tac=$(echo 'ibase=16;' "$nr_tac" | bc)
                     nr_cell_id=$(echo "$response" | awk -F',' '{print $6}')
+                    nr_cell_id=$(echo 'ibase=16;' "$nr_cell_id" | bc)
                     nr_arfcn=$(echo "$response" | awk -F',' '{print $7}')
                     nr_physical_cell_id=$(echo "$response" | awk -F',' '{print $8}')
                     nr_band_num=$(echo "$response" | awk -F',' '{print $9}')
@@ -1320,13 +1373,14 @@ cell_info()
                     ul_bandwidth_num=$(echo "$response" | awk -F',' '{print $10}')
                     lte_ul_bandwidth=$(get_bandwidth "LTE" ${ul_bandwidth_num})
                     lte_dl_bandwidth="$lte_ul_bandwidth"
-                    lte_rssnr=$(echo "$response" | awk -F',' '{print $11}')
+                    lte_rssnr=$(echo "$response" | grep "," | head -n1 | awk -F',' '{print $11}')
                     lte_rxlev_num=$(echo "$response" | awk -F',' '{print $12}')
                     lte_rxlev=$(get_rxlev "LTE" ${lte_rxlev_num})
                     lte_rsrp_num=$(echo "$response" | awk -F',' '{print $13}')
                     lte_rsrp=$(get_rsrp "LTE" ${lte_rsrp_num})
                     lte_rsrq_num=$(echo "$response" | awk -F',' '{print $14}' | sed 's/\r//g')
                     lte_rsrq=$(get_rsrq "LTE" ${lte_rsrq_num})
+                    lte_rssi="$rssi_actual"
                 ;;
                 "WCDMA"|"UMTS")
                     network_mode="WCDMA Mode"
@@ -1350,7 +1404,7 @@ cell_info()
             esac
 
             #联发科平台特殊处理（FM350-GL）
-            [[ "$name" = "FM350-GL" ]] && {
+            [[ "$platform" = "mediatek" ]] && {
                 nr_sinr="${nr_sinr_num}"
                 endc_nr_sinr="${endc_nr_sinr_num}"
             }
@@ -1358,112 +1412,64 @@ cell_info()
             #只选择第一个，然后退出
             break
         }
-        
     done
     class="Cell Information"
     add_plain_info_entry "network_mode" "$network_mode" "Network Mode"
     case $network_mode in
-    "NR5G-SA Mode"|"NR5G-SA CA Mode")
-        add_plain_info_entry "MMC" "$nr_mcc" "Mobile Country Code"
-        add_plain_info_entry "MNC" "$nr_mnc" "Mobile Network Code"
-        add_plain_info_entry "Duplex Mode" "$nr_duplex_mode" "Duplex Mode"
-        add_plain_info_entry "Cell ID" "$nr_cell_id" "Cell ID"
-        add_plain_info_entry "Physical Cell ID" "$nr_physical_cell_id" "Physical Cell ID"
-        add_plain_info_entry "TAC" "$nr_tac" "Tracking area code of cell served by neighbor Enb"
-        if [ $has_ca -eq 1 ]; then
-            add_plain_info_entry "ARFCN" "$nr_arfcn / $scc_arfcn" "Absolute Radio-Frequency Channel Number"
-            add_plain_info_entry "Band" "$nr_band / $scc_band" "Band"
-            add_plain_info_entry "DL Bandwidth" "${nr_dl_bandwidth}M / ${nr_scc_dl_bandwidth}M" "DL Bandwidth"
-        else
-            add_plain_info_entry "ARFCN" "$nr_arfcn" "Absolute Radio-Frequency Channel Number"
-            add_plain_info_entry "Band" "$nr_band" "Band"
-            add_plain_info_entry "DL Bandwidth" "${nr_dl_bandwidth}M" "DL Bandwidth"
-        fi
-        add_plain_info_entry "UL Bandwidth" "${nr_ul_bandwidth}M" "UL Bandwidth"
-        add_bar_info_entry "RSRP" "$nr_rsrp" "Reference Signal Received Power" -140 -44 dBm
-        add_bar_info_entry "RSRQ" "$nr_rsrq" "Reference Signal Received Quality" -19.5 -3 dB
-        add_bar_info_entry "SINR" "$nr_sinr" "Signal to Interference plus Noise Ratio Bandwidth" 0 30 dB
-        add_bar_info_entry "RxLev" "$nr_rxlev" "Received Signal Level" -140 -20 dBm
+    "NR5G-SA Mode"*)
+        # Use helper function for 5G
+        extra_info="NR5G-SA"
+        set_5g_cell_info "$nr_mcc" "$nr_mnc" "$nr_tac" "$nr_cell_id" "$nr_arfcn" \
+            "$nr_physical_cell_id" "$nr_band" "${nr_ul_bandwidth}M" "${nr_dl_bandwidth}M" \
+            "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "" "$nr_rxlev"
         add_plain_info_entry "SCS" "$nr_scs" "SCS"
         add_plain_info_entry "Srxlev" "$nr_srxlev" "Serving Cell Receive Level"
+        # Add CA info if present
+        if [ $ca_count -gt 1 ]; then
+            add_ca_info "5G" "$scc_arfcn" "$scc_pci" "$scc_band" "${scc_ul_bandwidth}M" "${scc_dl_bandwidth}M"
+            [ -n "$scc_ul_bandwidth" ] && add_plain_info_entry "UL CA" "Yes" "UL CA"
+        fi
         ;;
-    "EN-DC Mode")
+    "EN-DC Mode"*)
+        # LTE part
         add_plain_info_entry "LTE" "LTE" ""
-        add_plain_info_entry "MCC" "$endc_lte_mcc" "Mobile Country Code"
-        add_plain_info_entry "MNC" "$endc_lte_mnc" "Mobile Network Code"
-        add_plain_info_entry "Duplex Mode" "$endc_lte_duplex_mode" "Duplex Mode"
-        add_plain_info_entry "Cell ID" "$endc_lte_cell_id" "Cell ID"
-        add_plain_info_entry "Physical Cell ID" "$endc_lte_physical_cell_id" "Physical Cell ID"
-        add_plain_info_entry "EARFCN" "$endc_lte_earfcn" "E-UTRA Absolute Radio Frequency Channel Number"
-        add_plain_info_entry "Freq band indicator" "$endc_lte_freq_band_ind" "Freq band indicator"
-        add_plain_info_entry "Band" "$endc_lte_band" "Band"
-        add_plain_info_entry "UL Bandwidth" "$endc_lte_ul_bandwidth" "UL Bandwidth"
-        add_plain_info_entry "DL Bandwidth" "$endc_lte_dl_bandwidth" "DL Bandwidth"
-        add_plain_info_entry "TAC" "$endc_lte_tac" "Tracking area code of cell served by neighbor Enb"
-        add_bar_info_entry "RSRP" "$endc_lte_rsrp" "Reference Signal Received Power" -140 -44 dBm
-        add_bar_info_entry "RSRQ" "$endc_lte_rsrq" "Reference Signal Received Quality" -19.5 -3 dB
-        add_bar_info_entry "RSSI" "$endc_lte_rssi" "Received Signal Strength Indicator" -120 -20 dBm
-        add_bar_info_entry "SINR" "$endc_lte_sinr" "Signal to Interference plus Noise Ratio Bandwidth" 0 30 dB
-        add_plain_info_entry "RxLev" "$endc_lte_rxlev" "Received Signal Level"
-        add_plain_info_entry "RSSNR" "$endc_lte_rssnr" "Radio Signal Strength Noise Ratio"
+        extra_info="LTE"
+        set_4g_cell_info "$endc_lte_mcc" "$endc_lte_mnc" "$endc_lte_tac" "$endc_lte_cell_id" \
+            "$endc_lte_earfcn" "$endc_lte_physical_cell_id" "$endc_lte_band" \
+            "$endc_lte_ul_bandwidth" "$endc_lte_dl_bandwidth" "$endc_lte_rsrp" "$endc_lte_rsrq" \
+            "" "$endc_lte_rssnr" "$endc_lte_rxlev"
         add_plain_info_entry "CQI" "$endc_lte_cql" "Channel Quality Indicator"
         add_plain_info_entry "TX Power" "$endc_lte_tx_power" "TX Power"
         add_plain_info_entry "Srxlev" "$endc_lte_srxlev" "Serving Cell Receive Level"
-        add_plain_info_entry NR5G-NSA "NR5G-NSA" ""
-        add_plain_info_entry "MCC" "$endc_nr_mcc" "Mobile Country Code"
-        add_plain_info_entry "MNC" "$endc_nr_mnc" "Mobile Network Code"
-        add_plain_info_entry "Physical Cell ID" "$endc_nr_physical_cell_id" "Physical Cell ID"
-        add_plain_info_entry "ARFCN" "$endc_nr_arfcn" "Absolute Radio-Frequency Channel Number"
-        add_plain_info_entry "Band" "$endc_nr_band" "Band"
-        add_plain_info_entry "DL Bandwidth" "$endc_nr_dl_bandwidth" "DL Bandwidth"
-        add_bar_info_entry "RSRP" "$endc_nr_rsrp" "Reference Signal Received Power" -140 -44 dBm
-        add_bar_info_entry "RSRQ" "$endc_nr_rsrq" "Reference Signal Received Quality" -19.5 -3 dB
-        add_bar_info_entry "SINR" "$endc_nr_sinr" "Signal to Interference plus Noise Ratio Bandwidth" 0 30 dB
+        # NR5G-NSA part
+        add_plain_info_entry "NR5G-NSA" "NR5G-NSA" ""
+        extra_info="NR5G-NSA"
+        set_5g_cell_info "$endc_nr_mcc" "$endc_nr_mnc" "$endc_nr_tac" "$endc_nr_cell_id" \
+            "$endc_nr_arfcn" "$endc_nr_physical_cell_id" "$endc_nr_band" "" "$endc_nr_dl_bandwidth" \
+            "$endc_nr_rsrp" "$endc_nr_rsrq" "$endc_nr_sinr" "" "$endc_nr_rxlev"
         add_plain_info_entry "SCS" "$endc_nr_scs" "SCS"
-        
         ;;
-    "LTE Mode")
-        add_plain_info_entry "MCC" "$lte_mcc" "Mobile Country Code"
-        add_plain_info_entry "MNC" "$lte_mnc" "Mobile Network Code"
-        add_plain_info_entry "Duplex Mode" "$lte_duplex_mode" "Duplex Mode"
-        add_plain_info_entry "Cell ID" "$lte_cell_id" "Cell ID"
-        add_plain_info_entry "Physical Cell ID" "$lte_physical_cell_id" "Physical Cell ID"
-        add_plain_info_entry "EARFCN" "$lte_earfcn" "E-UTRA Absolute Radio Frequency Channel Number"
-        add_plain_info_entry "Freq band indicator" "$lte_freq_band_ind" "Freq band indicator"
-        add_plain_info_entry "Band" "$lte_band" "Band"
-        add_plain_info_entry "UL Bandwidth" "$lte_ul_bandwidth" "UL Bandwidth"
-        add_plain_info_entry "DL Bandwidth" "$lte_dl_bandwidth" "DL Bandwidth"
-        add_plain_info_entry "TAC" "$lte_tac" "Tracking area code of cell served by neighbor Enb"
-        add_bar_info_entry "RSRP" "$lte_rsrp" "Reference Signal Received Power" -140 -44 dBm
-        add_bar_info_entry "RSRQ" "$lte_rsrq" "Reference Signal Received Quality" -19.5 -3 dB
+    "LTE Mode"*)
+        extra_info="LTE"
+        set_4g_cell_info "$lte_mcc" "$lte_mnc" "$lte_tac" "$lte_cell_id" "$lte_earfcn" \
+            "$lte_physical_cell_id" "$lte_band" "$lte_ul_bandwidth" "$lte_dl_bandwidth" \
+            "$lte_rsrp" "$lte_rsrq" "" "$lte_rssnr" "$lte_rxlev"
         add_bar_info_entry "RSSI" "$lte_rssi" "Received Signal Strength Indicator" -120 -20 dBm
-        add_bar_info_entry "SINR" "$lte_sinr" "Signal to Interference plus Noise Ratio Bandwidth" 0 30 dB
-        add_plain_info_entry "RxLev" "$lte_rxlev" "Received Signal Level"
-        add_plain_info_entry "RSSNR" "$lte_rssnr" "Radio Signal Strength Noise Ratio"
         add_plain_info_entry "CQI" "$lte_cql" "Channel Quality Indicator"
         add_plain_info_entry "TX Power" "$lte_tx_power" "TX Power"
         add_plain_info_entry "Srxlev" "$lte_srxlev" "Serving Cell Receive Level"
-        
         ;;
     "WCDMA Mode")
-        add_plain_info_entry "MCC" "$wcdma_mcc" "Mobile Country Code"
-        add_plain_info_entry "MNC" "$wcdma_mnc" "Mobile Network Code"
-        add_plain_info_entry "LAC" "$wcdma_lac" "Location Area Code"
-        add_plain_info_entry "Cell ID" "$wcdma_cell_id" "Cell ID"
-        add_plain_info_entry "UARFCN" "$wcdma_uarfcn" "UTRA Absolute Radio Frequency Channel Number"
-        add_plain_info_entry "PSC" "$wcdma_psc" "Primary Scrambling Code"
-        add_plain_info_entry "RAC" "$wcdma_rac" "Routing Area Code"
-        add_plain_info_entry "Band" "$wcdma_band" "Band"
-        add_bar_info_entry "RSCP" "$wcdma_rscp" "Received Signal Code Power" -120 -25 dBm
-        add_plain_info_entry "Ec/Io" "$wcdma_ecio" "Ec/Io"
+        extra_info="WCDMA"
+        set_3g_cell_info "$wcdma_mcc" "$wcdma_mnc" "$wcdma_lac" "$wcdma_cell_id" \
+            "$wcdma_uarfcn" "$wcdma_psc" "$wcdma_band" "" "" "$wcdma_rscp" "" "$wcdma_ecio" \
+            "$wcdma_rxlev" "$wcdma_rac"
         add_plain_info_entry "Ec/No" "$wcdma_ecno" "Ec/No"
         add_plain_info_entry "Physical Channel" "$wcdma_phych" "Physical Channel"
         add_plain_info_entry "Spreading Factor" "$wcdma_sf" "Spreading Factor"
         add_plain_info_entry "Slot" "$wcdma_slot" "Slot"
         add_plain_info_entry "Speech Code" "$wcdma_speech_code" "Speech Code"
         add_plain_info_entry "Compression Mode" "$wcdma_com_mod" "Compression Mode"
-        add_plain_info_entry "RxLev" "$wcdma_rxlev" "RxLev"
-        
         ;;
     esac
 }
